@@ -2225,6 +2225,26 @@ void CGOpenMPRuntime::emitThreadPrivateVarInit(
       createRuntimeFunction(OMPRTL__kmpc_threadprivate_register), Args);
 }
 
+llvm::Value *CGOpenMPRuntime::emitBoundNumThreads(CodeGenFunction &CGF, SourceLocation Loc) {
+  llvm::Type *TypeParams[] = {getIdentTyPointerTy()};
+  llvm::FunctionType *getBoundNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, TypeParams, false);
+  llvm::Constant *getBoundNumThreadsFunc = CGF.CGM.
+    CreateRuntimeFunction(getBoundNumThreadsTy, "__kmpc_bound_num_threads");
+  std::vector<llvm::Value *> args;
+  args.push_back(emitUpdateLocation(CGF, Loc));
+  return CGF.Builder.CreateCall(getBoundNumThreadsFunc, args);
+}
+
+llvm::Value *CGOpenMPRuntime::emitGlobalNumThreads(CodeGenFunction &CGF, SourceLocation Loc) {
+  llvm::Type *TypeParams[] = {getIdentTyPointerTy()};
+  llvm::FunctionType *getGlobalNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, TypeParams, false);
+  llvm::Constant *getGlobalNumThreadsFunc = CGF.CGM.
+    CreateRuntimeFunction(getGlobalNumThreadsTy, "__kmpc_global_num_threads");
+  std::vector<llvm::Value *> args;
+  args.push_back(emitUpdateLocation(CGF, Loc));
+  return CGF.Builder.CreateCall(getGlobalNumThreadsFunc, args);
+}
+
 llvm::Function *CGOpenMPRuntime::emitThreadPrivateVarDefinition(
     const VarDecl *VD, Address VDAddr, SourceLocation Loc,
     bool PerformInit, CodeGenFunction *CGF) {

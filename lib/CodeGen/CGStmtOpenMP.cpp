@@ -1138,29 +1138,130 @@ static void emitEmptyBoundParameters(CodeGenFunction &,
                                      llvm::SmallVectorImpl<llvm::Value *> &) {}
 
 void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
-  // Emit parallel region as a standalone region.
-  auto &&CodeGen = [&S](CodeGenFunction &CGF, PrePostActionTy &) {
-    OMPPrivateScope PrivateScope(CGF);
-    bool Copyins = CGF.EmitOMPCopyinClause(S);
-    (void)CGF.EmitOMPFirstprivateClause(S, PrivateScope);
-    if (Copyins) {
-      // Emit implicit barrier to synchronize threads and avoid data races on
-      // propagation master's thread values of threadprivate variables to local
-      // instances of that variables of all other implicit threads.
-      CGF.CGM.getOpenMPRuntime().emitBarrierCall(
-          CGF, S.getLocStart(), OMPD_unknown, false,
-          true);
-    }
-    CGF.EmitOMPPrivateClause(S, PrivateScope);
-    CGF.EmitOMPReductionClauseInit(S, PrivateScope);
-    (void)PrivateScope.Privatize();
-    CGF.EmitStmt(cast<CapturedStmt>(S.getAssociatedStmt())->getCapturedStmt());
-    CGF.EmitOMPReductionClauseFinal(S, OMPD_parallel);
-  };
-  emitCommonOMPParallelDirective(*this, S, OMPD_parallel, CodeGen,
-                                 emitEmptyBoundParameters);
-  emitPostUpdateForReductionClause(
-      *this, S, [](CodeGenFunction &) -> llvm::Value * { return nullptr; });
+  // Creates a BB = ompfor.end
+  llvm::BasicBlock *CondBlock = getJumpDestInCurrentScope("ompfor.cond").getBlock();
+  llvm::BasicBlock *DetachBlock = createBasicBlock("ompfor.detach");
+  llvm::BasicBlock *ForBodyEntry = createBasicBlock("ompfor.body.entry");
+  llvm::BasicBlock *ForBody = createBasicBlock("ompfor.body");
+  JumpDest Preattach = getJumpDestInCurrentScope("ompfor.preattach");
+  llvm::BasicBlock *PreattachBlock = Preattach.getBlock();
+  llvm::BasicBlock *IncrementBlock = getJumpDestInCurrentScope("ompfor.inc").getBlock();
+  llvm::BasicBlock *LoopExitBlock = getJumpDestInCurrentScope("ompfor.end").getBlock();
+  llvm::BasicBlock *SyncContinueBlock = createBasicBlock("ompfor.end.continue");
+
+  // Sync region start emission
+  PushSyncRegion();
+  llvm::Instruction *SyncRegionStart = EmitSyncRegionStart();
+  CurSyncRegion->setSyncRegionStart(SyncRegionStart);
+
+
+  LexicalScope ForScope(*this, S.getSourceRange());
+  // Store the blocks to use for break and continue.
+  BreakContinueStack.push_back(BreakContinue(Preattach, Preattach));
+  // Create a cleanup scope for the condition variable cleanups.
+  LexicalScope ConditionScope(*this, S.getSourceRange());
+  // Save the old alloca insert point.
+  llvm::AssertingVH<llvm::Instruction> OldAllocaInsertPt = AllocaInsertPt;
+  // Save the old EH state.
+  llvm::BasicBlock *OldEHResumeBlock = EHResumeBlock;
+  llvm::Value *OldExceptionSlot = ExceptionSlot;
+  llvm::AllocaInst *OldEHSelectorSlot = EHSelectorSlot;
+  LoopStack.setSpawnStrategy(LoopAttributes::DAC);
+  const SourceRange &R = S.getSourceRange();
+  LoopStack.push(CondBlock, CGM.getContext(), None,
+                 SourceLocToDebugLoc(R.getBegin()),
+                 SourceLocToDebugLoc(R.getEnd()));
+
+
+  // Emit for loop init stmt : int i = 1
+  llvm::ConstantInt * noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int64Ty, 1, /*isSigned=*/false);
+  llvm::AllocaInst * loopCounterAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), 
+    noOfAllocatedElements, "i");
+  llvm::Value * loopCounterInitVal = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
+  Builder.CreateAlignedStore(loopCounterInitVal, loopCounterAlloca, CharUnits::fromQuantity(4));
+  Builder.CreateBr(CondBlock); //TODO: Profile counts
+
+  // Emit ompfor.cond
+  Builder.SetInsertPoint(CondBlock);
+  llvm::Value *loopCounterCurrVal = Builder.CreateAlignedLoad(loopCounterAlloca, CharUnits::fromQuantity(4));
+  //llvm::Value *boundVal = CGM.getOpenMPRuntime().emitBoundNumThreads(*this, S.getLocStart());
+  //llvm::Value *boundVal = CGM.getOpenMPRuntime().emitGlobalNumThreads(*this, S.getLocStart());
+  llvm::FunctionType *getNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, false);
+  llvm::Module &module = CGM.getModule();
+
+  std::vector<llvm::Value *> args;
+  //llvm::Value *boundVal = Builder.CreateCall(getNumThreadsFunc, args);
+
+  llvm::Value *boundVal = llvm::ConstantInt::get(CGM.Int32Ty, 10, /*isSigned=*/false);
+  llvm::Value *loopCondVal = Builder.CreateICmpULE(loopCounterCurrVal, boundVal);
+  Builder.CreateCondBr(loopCondVal, DetachBlock, LoopExitBlock);
+  EmitBlock(CondBlock);
+  
+  // Emit ompfor.detach
+  Builder.SetInsertPoint(DetachBlock);
+  Builder.CreateDetach(ForBodyEntry, IncrementBlock, SyncRegionStart);
+  EmitBlock(DetachBlock);
+
+  // Create a new alloca insert point.
+  llvm::Value *Undef = llvm::UndefValue::get(Int32Ty);
+  AllocaInsertPt = new llvm::BitCastInst(Undef, Int32Ty, "", ForBodyEntry);
+  // Set up nested EH state.
+  EHResumeBlock = nullptr;
+  ExceptionSlot = nullptr;
+  EHSelectorSlot = nullptr;
+
+  // Emit ompfor.body.entry
+  Builder.SetInsertPoint(ForBodyEntry);
+  Builder.CreateBr(ForBody);
+  EmitBlock(ForBodyEntry);
+
+  // Emit ompfor.body
+  Builder.SetInsertPoint(ForBody);
+  EmitStmt(S.getAssociatedStmt());
+  Builder.CreateAlignedLoad(loopCounterAlloca, CharUnits::fromQuantity(4)); //dummy stmt
+  Builder.CreateBr(PreattachBlock);
+  EmitBlock(ForBody);
+
+  incrementProfileCounter(&S);
+
+  // Emit ompfor.preattach
+  Builder.SetInsertPoint(PreattachBlock);
+  Builder.CreateReattach(IncrementBlock, SyncRegionStart);
+  EmitBlock(PreattachBlock);
+
+  // Restore CGF state after detached region.
+  // Restore the alloca insertion point.
+  llvm::Instruction *Ptr = AllocaInsertPt;
+  AllocaInsertPt = OldAllocaInsertPt;
+  Ptr->eraseFromParent();
+
+  // Restore the EH state.
+  EmitIfUsed(*this, EHResumeBlock);
+  EHResumeBlock = OldEHResumeBlock;
+  ExceptionSlot = OldExceptionSlot;
+  EHSelectorSlot = OldEHSelectorSlot;
+
+  // Emit ompfor.inc
+  Builder.SetInsertPoint(IncrementBlock);
+  loopCounterCurrVal = Builder.CreateAlignedLoad(loopCounterAlloca, CharUnits::fromQuantity(4));
+  llvm::Value *stepVal = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
+  llvm::Value *incrementedLoopCounterVal = Builder.CreateNSWAdd(loopCounterCurrVal, stepVal);
+  Builder.CreateAlignedStore(incrementedLoopCounterVal, loopCounterAlloca, CharUnits::fromQuantity(4));
+  EmitStopPoint(&S);
+  Builder.CreateBr(CondBlock);
+  EmitBlock(IncrementBlock);
+
+  BreakContinueStack.pop_back();
+  LoopStack.pop();
+
+  // Emit for.end
+  Builder.SetInsertPoint(LoopExitBlock);
+  Builder.CreateSync(SyncContinueBlock, SyncRegionStart);
+  EmitBlock(LoopExitBlock);
+  
+  // Emit for.end.continue
+  EmitBlock(SyncContinueBlock);
+  PopSyncRegion();
 }
 
 void CodeGenFunction::EmitOMPLoopBody(const OMPLoopDirective &D,

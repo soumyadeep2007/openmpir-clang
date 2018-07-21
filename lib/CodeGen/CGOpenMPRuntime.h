@@ -612,6 +612,10 @@ public:
   virtual ~CGOpenMPRuntime() {}
   virtual void clear();
 
+  llvm::Value *emitBoundNumThreads(CodeGenFunction &CGF, SourceLocation Loc);
+
+  llvm::Value *emitGlobalNumThreads(CodeGenFunction &CGF, SourceLocation Loc);
+
   /// Emit code for the specified user defined reduction construct.
   virtual void emitUserDefinedReduction(CodeGenFunction *CGF,
                                         const OMPDeclareReductionDecl *D);
