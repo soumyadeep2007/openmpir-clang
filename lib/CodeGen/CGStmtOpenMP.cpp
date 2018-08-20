@@ -2710,6 +2710,10 @@ void CodeGenFunction::EmitOMPParallelForDirective(
     const OMPParallelForDirective &OS){
   const ForStmt S = cast<ForStmt>(*OS.getAssociatedStmt()); 
 
+  static std::pair<LValue, LValue> p = emitForLoopBounds(*this, OS);
+  LValue lowerBound = p.first;
+  LValue upperBound = p.second;
+
   JumpDest LoopExit = getJumpDestInCurrentScope("ompfor.end");
 
   PushSyncRegion();
@@ -2758,7 +2762,7 @@ void CodeGenFunction::EmitOMPParallelForDirective(
 
   llvm::BasicBlock *SyncContinueBlock = createBasicBlock("ompfor.end.continue");
   bool madeSync = false;
-  const VarDecl *LoopVar = S.getConditionVariable();
+  const VarDecl *LoopVar = S.getConditionVariable(); // for (int x = random(); int y = mangle(x); ++x) {.. here y = cond variable.
 
   RValue LoopVarInitRV;
   llvm::BasicBlock *DetachBlock;
@@ -2836,19 +2840,73 @@ void CodeGenFunction::EmitOMPParallelForDirective(
     EmitAutoVarCleanups(LVEmission);
   }
 
-  Builder.CreateBr(ForBody);
+  llvm::BasicBlock *ForBodyCondBlock = createBasicBlock("ompfor.body.cond");
+  //-----------------------------------ompfor.body.entry----------------------------------------------------------
+  Builder.SetInsertPoint(ForBodyEntry);
+  llvm::ConstantInt *noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int64Ty, 1, /*isSigned=*/false);
+  llvm::ConstantInt *chunkSize = llvm::ConstantInt::get(CGM.Int64Ty, 4, /*isSigned=*/false); //TODO
+  llvm::AllocaInst *stepSizeAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+    noOfAllocatedElements, "stepSize");
+  llvm::Value *stepSizeVal = llvm::ConstantInt::get(CGM.Int64Ty, 5, /*isSigned=*/false); //TODO
+  Builder.CreateAlignedStore(stepSizeVal, stepSizeAlloca, CharUnits::fromQuantity(4));
 
+  llvm::FunctionType *getThreadNumTy = llvm::FunctionType::get(CGM.Int64Ty, false);
+  llvm::Constant *getThreadNumFunc = CGM.getModule().getOrInsertFunction("omp_get_thread_num", getThreadNumTy);
+  std::vector<llvm::Value *> args;
+  llvm::Value *threadNumVal = Builder.CreateCall(getThreadNumFunc, args, "tno");
+  llvm::Value *itStart = Builder.CreateMul(threadNumVal, chunkSize, "itStart");
+  llvm::Value *itEnd = Builder.CreateAdd(itStart, chunkSize, "itEnd");
+  
+  llvm::Value *loopCounterInitVal = llvm::ConstantInt::get(CGM.Int64Ty, 5, /*isSigned=*/false); //TODO
+
+  llvm::AllocaInst *iStartAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+    noOfAllocatedElements, "iStart");
+  llvm::Value *iStartVal = Builder.CreateAdd(loopCounterInitVal, Builder.CreateMul(itStart, stepSizeVal));
+  Builder.CreateAlignedStore(iStartVal, iStartAlloca, CharUnits::fromQuantity(4));
+  llvm::AllocaInst *iEndAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+    noOfAllocatedElements, "iEnd");
+  llvm::Value *iEndVal = Builder.CreateAdd(loopCounterInitVal, Builder.CreateMul(itEnd, stepSizeVal));
+  Builder.CreateAlignedStore(iEndVal, iEndAlloca, CharUnits::fromQuantity(4));
+
+  Builder.CreateBr(ForBodyCondBlock);
+
+  ForBodyEntry->dump();
+  //--------------------------------------------------------------------------------------------------------------
+
+  //-----------------------------------ompfor.body.cond-----------------------------------------------------------
+  Builder.SetInsertPoint(ForBodyCondBlock);
+  llvm::Value *iStartCurrentVal = Builder.CreateAlignedLoad(iStartAlloca, CharUnits::fromQuantity(4));
+  iEndVal = Builder.CreateAlignedLoad(iEndAlloca, CharUnits::fromQuantity(4));
+  llvm::Value *condVal = Builder.CreateICmpULT(iStartCurrentVal, iEndVal);
+  Builder.CreateCondBr(condVal, ForBody, Preattach.getBlock());
+  EmitBlock(ForBodyCondBlock);
+
+  ForBodyCondBlock->dump();
+  //--------------------------------------------------------------------------------------------------------------
   EmitBlock(ForBody);
 
   incrementProfileCounter(&S);
 
+  llvm::BasicBlock *ForBodyIncBlock = createBasicBlock("ompfor.body.inc");
   {
     // Create a separate cleanup scope for the body, in case it is not
     // a compound statement.
     RunCleanupsScope BodyScope(*this);
     EmitStmt(S.getBody());
-    Builder.CreateBr(Preattach.getBlock());
+    Builder.CreateBr(ForBodyIncBlock);
   }
+
+  //-----------------------------------ompfor.body.inc------------------------------------------------------------
+  Builder.SetInsertPoint(ForBodyIncBlock);
+  iStartCurrentVal = Builder.CreateAlignedLoad(iStartAlloca, CharUnits::fromQuantity(4));
+  stepSizeVal = Builder.CreateAlignedLoad(iStartAlloca, CharUnits::fromQuantity(4));
+  llvm::Value *iStartUpdatedValue = Builder.CreateAdd(iStartCurrentVal, stepSizeVal);
+  Builder.CreateAlignedStore(iStartUpdatedValue, iStartAlloca, CharUnits::fromQuantity(4));
+  Builder.CreateBr(ForBodyCondBlock);
+  EmitBlock(ForBodyIncBlock);
+
+  ForBodyIncBlock->dump();
+  //--------------------------------------------------------------------------------------------------------------
 
   // Finish detached body and emit the reattach.
   {
