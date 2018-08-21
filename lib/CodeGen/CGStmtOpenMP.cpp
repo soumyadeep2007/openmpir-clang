@@ -1179,7 +1179,7 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
     noOfAllocatedElements, "i");
   llvm::Value * loopCounterInitVal = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
   Builder.CreateAlignedStore(loopCounterInitVal, loopCounterAlloca, CharUnits::fromQuantity(4));
-  Builder.CreateBr(CondBlock); //TODO: Profile counts
+  llvm::Instruction * BranchToCondBlock = (llvm::Instruction *) Builder.CreateBr(CondBlock); //TODO: Profile counts
 
   // Emit ompfor.cond
   Builder.SetInsertPoint(CondBlock);
@@ -1189,8 +1189,9 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
   llvm::FunctionType *getNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, false);
   llvm::Module &module = CGM.getModule();
 
-  std::vector<llvm::Value *> args;
-  //llvm::Value *boundVal = Builder.CreateCall(getNumThreadsFunc, args);
+  /*std::vector<llvm::Value *> args;
+  llvm::Constant *getNumThreadsFunc = CGM.getModule().getOrInsertFunction("omp_get_num_threads", getNumThreadsTy);
+  llvm::Value *boundVal = Builder.CreateCall(getNumThreadsFunc, args);*/
 
   llvm::Value *boundVal = llvm::ConstantInt::get(CGM.Int32Ty, 10, /*isSigned=*/false);
   llvm::Value *loopCondVal = Builder.CreateICmpULE(loopCounterCurrVal, boundVal);
@@ -1262,6 +1263,8 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
   // Emit for.end.continue
   EmitBlock(SyncContinueBlock);
   PopSyncRegion();
+
+  BranchToCondBlock->dropUnknownNonDebugMetadata();
 }
 
 void CodeGenFunction::EmitOMPLoopBody(const OMPLoopDirective &D,
@@ -2869,8 +2872,8 @@ void CodeGenFunction::EmitOMPParallelForDirective(
   llvm::Value *stepSizeVal = llvm::ConstantInt::get(CGM.Int32Ty, 5, /*isSigned=*/false); //TODO
   Builder.CreateAlignedStore(stepSizeVal, stepSizeAlloca, CharUnits::fromQuantity(4));
 
-  llvm::FunctionType *getThreadNumTy = llvm::FunctionType::get(CGM.Int32Ty, false);
-  llvm::Constant *getThreadNumFunc = CGM.getModule().getOrInsertFunction("omp_get_thread_num", getThreadNumTy);
+  /*llvm::FunctionType *getThreadNumTy = llvm::FunctionType::get(CGM.Int32Ty, false);
+  llvm::Constant *getThreadNumFunc = CGM.getModule().getOrInsertFunction("omp_get_thread_num", getThreadNumTy);*/
   std::vector<llvm::Value *> args;
   llvm::Value *threadNumVal = Builder.CreateAlignedLoad(outerLoopCounterVarAlloca, CharUnits::fromQuantity(4), "tNo");
   llvm::Value *itStart = Builder.CreateMul(threadNumVal, chunkSize, "itStart");
