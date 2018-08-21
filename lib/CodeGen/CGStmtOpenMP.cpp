@@ -1174,7 +1174,7 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
 
 
   // Emit for loop init stmt : int i = 1
-  llvm::ConstantInt * noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int64Ty, 1, /*isSigned=*/false);
+  llvm::ConstantInt * noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
   llvm::AllocaInst * loopCounterAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), 
     noOfAllocatedElements, "i");
   llvm::Value * loopCounterInitVal = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
@@ -2722,8 +2722,22 @@ void CodeGenFunction::EmitOMPParallelForDirective(
 
   LexicalScope ForScope(*this, S.getSourceRange());
 
-  if (S.getInit())
+  llvm::BasicBlock *currentBasicBlock = SyncRegionStart->getParent();
+  StringRef outerLoopCounterVarName;
+  llvm::Value *outerLoopCounterVarAlloca;
+  if (S.getInit()) {
+    VarDecl *loopCounterVarDeclStmt = (VarDecl *)((DeclStmt *)(S.getInit()))->getSingleDecl();
+    ((IntegerLiteral *)(loopCounterVarDeclStmt->getInit()))->setValue(getContext(), llvm::APInt(32, 1)); //loop counter should iterate from [1, p]
+    outerLoopCounterVarName = loopCounterVarDeclStmt->getName();
     EmitStmt(S.getInit());
+    //outerLoopCounterVarAlloca = currentBasicBlock->getValueSymbolTable()->lookup(outerLoopCounterVarName); //cant use as the ValueSymbolTable type isn't yet declared
+    for (auto &I : *currentBasicBlock) { // find loop counter alloca
+      if(I.getName().equals(outerLoopCounterVarName)) {
+          outerLoopCounterVarAlloca = &I;
+          break;  
+      }
+    }
+  }
 
   assert(S.getCond() && "omp loop has no condition");
 
@@ -2790,7 +2804,12 @@ void CodeGenFunction::EmitOMPParallelForDirective(
 
     // C99 6.8.5p2/p4: The first substatement is executed if the expression
     // compares unequal to 0.  The condition must be a scalar type.
-    llvm::Value *BoolCondVal = EvaluateExprAsBool(S.getCond());
+    llvm::Value *outerLoopCounterCurrVal = Builder.CreateAlignedLoad(outerLoopCounterVarAlloca, CharUnits::fromQuantity(4));
+    /*llvm::FunctionType *getNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, false);
+    llvm::Constant *getNumThreadsFunc = CGM.getModule().getOrInsertFunction("omp_get_num_threads", getNumThreadsTy);
+    llvm::Value *boundVal = Builder.CreateCall(getNumThreadsFunc, args);*/
+    llvm::Value *boundVal = llvm::ConstantInt::get(CGM.Int32Ty, 40, /*isSigned=*/false);
+    llvm::Value *BoolCondVal = Builder.CreateICmpULE(outerLoopCounterCurrVal, boundVal);
     Builder.CreateCondBr(
         BoolCondVal, DetachBlock, ExitBlock,
         createProfileWeightsForLoop(S.getCond(), getProfileCount(S.getBody())));
@@ -2843,34 +2862,32 @@ void CodeGenFunction::EmitOMPParallelForDirective(
   llvm::BasicBlock *ForBodyCondBlock = createBasicBlock("ompfor.body.cond");
   //-----------------------------------ompfor.body.entry----------------------------------------------------------
   Builder.SetInsertPoint(ForBodyEntry);
-  llvm::ConstantInt *noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int64Ty, 1, /*isSigned=*/false);
-  llvm::ConstantInt *chunkSize = llvm::ConstantInt::get(CGM.Int64Ty, 4, /*isSigned=*/false); //TODO
-  llvm::AllocaInst *stepSizeAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+  llvm::ConstantInt *noOfAllocatedElements = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
+  llvm::ConstantInt *chunkSize = llvm::ConstantInt::get(CGM.Int32Ty, 4, /*isSigned=*/false); //TODO
+  llvm::AllocaInst *stepSizeAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), 
     noOfAllocatedElements, "stepSize");
-  llvm::Value *stepSizeVal = llvm::ConstantInt::get(CGM.Int64Ty, 5, /*isSigned=*/false); //TODO
+  llvm::Value *stepSizeVal = llvm::ConstantInt::get(CGM.Int32Ty, 5, /*isSigned=*/false); //TODO
   Builder.CreateAlignedStore(stepSizeVal, stepSizeAlloca, CharUnits::fromQuantity(4));
 
-  llvm::FunctionType *getThreadNumTy = llvm::FunctionType::get(CGM.Int64Ty, false);
+  llvm::FunctionType *getThreadNumTy = llvm::FunctionType::get(CGM.Int32Ty, false);
   llvm::Constant *getThreadNumFunc = CGM.getModule().getOrInsertFunction("omp_get_thread_num", getThreadNumTy);
   std::vector<llvm::Value *> args;
-  llvm::Value *threadNumVal = Builder.CreateCall(getThreadNumFunc, args, "tno");
+  llvm::Value *threadNumVal = Builder.CreateAlignedLoad(outerLoopCounterVarAlloca, CharUnits::fromQuantity(4), "tNo");
   llvm::Value *itStart = Builder.CreateMul(threadNumVal, chunkSize, "itStart");
   llvm::Value *itEnd = Builder.CreateAdd(itStart, chunkSize, "itEnd");
   
-  llvm::Value *loopCounterInitVal = llvm::ConstantInt::get(CGM.Int64Ty, 5, /*isSigned=*/false); //TODO
+  llvm::Value *loopCounterInitVal = llvm::ConstantInt::get(CGM.Int32Ty, 5, /*isSigned=*/false); //TODO
 
-  llvm::AllocaInst *iStartAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+  llvm::AllocaInst *iStartAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), 
     noOfAllocatedElements, "iStart");
   llvm::Value *iStartVal = Builder.CreateAdd(loopCounterInitVal, Builder.CreateMul(itStart, stepSizeVal));
   Builder.CreateAlignedStore(iStartVal, iStartAlloca, CharUnits::fromQuantity(4));
-  llvm::AllocaInst *iEndAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 64), 
+  llvm::AllocaInst *iEndAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), 
     noOfAllocatedElements, "iEnd");
   llvm::Value *iEndVal = Builder.CreateAdd(loopCounterInitVal, Builder.CreateMul(itEnd, stepSizeVal));
   Builder.CreateAlignedStore(iEndVal, iEndAlloca, CharUnits::fromQuantity(4));
 
   Builder.CreateBr(ForBodyCondBlock);
-
-  ForBodyEntry->dump();
   //--------------------------------------------------------------------------------------------------------------
 
   //-----------------------------------ompfor.body.cond-----------------------------------------------------------
@@ -2880,8 +2897,6 @@ void CodeGenFunction::EmitOMPParallelForDirective(
   llvm::Value *condVal = Builder.CreateICmpULT(iStartCurrentVal, iEndVal);
   Builder.CreateCondBr(condVal, ForBody, Preattach.getBlock());
   EmitBlock(ForBodyCondBlock);
-
-  ForBodyCondBlock->dump();
   //--------------------------------------------------------------------------------------------------------------
   EmitBlock(ForBody);
 
@@ -2893,6 +2908,9 @@ void CodeGenFunction::EmitOMPParallelForDirective(
     // a compound statement.
     RunCleanupsScope BodyScope(*this);
     EmitStmt(S.getBody());
+    for (auto &I : *ForBody) {
+      I.replaceUsesOfWith(outerLoopCounterVarAlloca, iStartAlloca);
+    }
     Builder.CreateBr(ForBodyIncBlock);
   }
 
@@ -2904,8 +2922,6 @@ void CodeGenFunction::EmitOMPParallelForDirective(
   Builder.CreateAlignedStore(iStartUpdatedValue, iStartAlloca, CharUnits::fromQuantity(4));
   Builder.CreateBr(ForBodyCondBlock);
   EmitBlock(ForBodyIncBlock);
-
-  ForBodyIncBlock->dump();
   //--------------------------------------------------------------------------------------------------------------
 
   // Finish detached body and emit the reattach.
@@ -2933,7 +2949,9 @@ void CodeGenFunction::EmitOMPParallelForDirective(
 
   // Emit the increment next.
   EmitBlock(Continue.getBlock());
-  EmitStmt(Inc);
+  llvm::Value *outerLoopCounterCurrVal = Builder.CreateAlignedLoad(outerLoopCounterVarAlloca, CharUnits::fromQuantity(4));
+  Builder.CreateAlignedStore(Builder.CreateAdd(outerLoopCounterCurrVal, llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false)), 
+    outerLoopCounterVarAlloca, CharUnits::fromQuantity(4));
 
   BreakContinueStack.pop_back();
 
