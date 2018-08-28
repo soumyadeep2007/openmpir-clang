@@ -1179,6 +1179,14 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
     noOfAllocatedElements, "i");
   llvm::Value * loopCounterInitVal = llvm::ConstantInt::get(CGM.Int32Ty, 1, /*isSigned=*/false);
   Builder.CreateAlignedStore(loopCounterInitVal, loopCounterAlloca, CharUnits::fromQuantity(4));
+
+  std::vector<llvm::Value *> args;
+  llvm::FunctionType *getNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, false);
+  llvm::Value *numThreadsAlloca = Builder.CreateAlloca(llvm::IntegerType::get(getLLVMContext(), 32), nullptr, "numThreads");
+  llvm::Constant *getNumThreadsFunc = CGM.getModule().getOrInsertFunction("omp_get_num_threads", getNumThreadsTy);
+  llvm::Value *numThreadsVal = Builder.CreateCall(getNumThreadsFunc, args);
+  Builder.CreateAlignedStore(numThreadsVal, numThreadsAlloca, CharUnits::fromQuantity(4));
+
   llvm::Instruction * BranchToCondBlock = (llvm::Instruction *) Builder.CreateBr(CondBlock); //TODO: Profile counts
 
   // Emit ompfor.cond
@@ -1186,14 +1194,10 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
   llvm::Value *loopCounterCurrVal = Builder.CreateAlignedLoad(loopCounterAlloca, CharUnits::fromQuantity(4));
   //llvm::Value *boundVal = CGM.getOpenMPRuntime().emitBoundNumThreads(*this, S.getLocStart());
   //llvm::Value *boundVal = CGM.getOpenMPRuntime().emitGlobalNumThreads(*this, S.getLocStart());
-  llvm::FunctionType *getNumThreadsTy = llvm::FunctionType::get(CGM.Int32Ty, false);
   llvm::Module &module = CGM.getModule();
 
-  /*std::vector<llvm::Value *> args;
-  llvm::Constant *getNumThreadsFunc = CGM.getModule().getOrInsertFunction("omp_get_num_threads", getNumThreadsTy);
-  llvm::Value *boundVal = Builder.CreateCall(getNumThreadsFunc, args);*/
-
-  llvm::Value *boundVal = llvm::ConstantInt::get(CGM.Int32Ty, 10, /*isSigned=*/false);
+  llvm::Value *boundVal = Builder.CreateAlignedLoad(numThreadsAlloca, CharUnits::fromQuantity(4));
+  //llvm::Value *boundVal = llvm::ConstantInt::get(CGM.Int32Ty, 10, /*isSigned=*/false);
   llvm::Value *loopCondVal = Builder.CreateICmpULE(loopCounterCurrVal, boundVal);
   Builder.CreateCondBr(loopCondVal, DetachBlock, LoopExitBlock);
   EmitBlock(CondBlock);
